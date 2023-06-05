@@ -1,0 +1,12 @@
+mappings: # One item per switch / pixelblaze
+  - hue: kitchen_led_control
+    pb: kitchen
+    default_brightness: 1
+  - hue: drinks_led_control
+    pb: drinks
+    default_brightness: 1
+mqtt: # Set the host, port, username, and password of your MQTT server here
+  host: [MQTT_HOST]
+  port: [MQTT_PORT]
+  user: [MQTT_USER]
+  password: [MQTT_PASSWORD]
