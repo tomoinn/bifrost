@@ -2,7 +2,7 @@ import logging
 import os
 import signal
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, auto
 from queue import Empty
 from queue import SimpleQueue
 from typing import Optional
@@ -139,9 +139,27 @@ def build_message_queue(c: client.Client) -> SimpleQueue:
         button_message = HueButtonEvent.from_message(m=message)
         if button_message is not None:
             queue.put_nowait(button_message)
+        else:
+            bifrost_message = BifrostEvent.from_message(m=message)
+            if bifrost_message is not None:
+                queue.put_nowait(bifrost_message)
 
     c.on_message = on_message
     return queue
+
+
+def parse_ip(ip: str) -> bool:
+    s = ip.split('.')
+    if len(s) != 4:
+        return False
+    for n in s:
+        try:
+            parsed_int = int(n)
+            if parsed_int < 0 or parsed_int > 255:
+                raise ValueError
+        except ValueError:
+            return False
+    return True
 
 
 class PixelBlazeLocator:
@@ -150,15 +168,30 @@ class PixelBlazeLocator:
         self.pb_map: dict[str, Pixelblaze] = {}
 
     def find_pixelblaze(self, name: str) -> Optional[Pixelblaze]:
-        if name in self.pb_map:
-            return self.pb_map[name]
+        if name in self.pb_map and not (pixelblaze := self.pb_map[name]).connectionBroken:
+            return pixelblaze
         else:
-            for pb in Pixelblaze.EnumerateDevices(timeout=0):
-                pb_name = pb.getDeviceName()
-                if pb_name not in self.pb_map or (pb_name in self.pb_map and self.pb_map[pb_name].connectionBroken):
-                    self.pb_map[pb_name] = pb
+            # If we get here and the pixelblaze instance is in the map then we need to tidy up
             if name in self.pb_map:
-                return self.pb_map[name]
+                LOG.debug(f'cleaning up previously closed client {name}')
+                del self.pb_map[name]
+            # Check whether 'name' is a numeric address
+            if parse_ip(name):
+                LOG.debug(f'found valid IP address, bypassing lookup for {name}')
+                self.pb_map[name] = Pixelblaze(ipAddress=name)
+            else:
+                LOG.debug(f'starting lookup')
+                for pb in Pixelblaze.EnumerateDevices(timeout=1000):
+                    pb_name = pb.getDeviceName()
+                    LOG.debug(f'lookup - found device with name {pb_name}')
+                    if pb_name not in self.pb_map or (pb_name in self.pb_map and self.pb_map[pb_name].connectionBroken):
+                        self.pb_map[pb_name] = pb
+                LOG.debug(f'lookup completed')
+            if name in self.pb_map:
+                pixelblaze = self.pb_map[name]
+                pixelblaze.setSequencerMode(Pixelblaze.sequencerModes.Playlist)
+                pixelblaze.setSequencerState(False)
+                return pixelblaze
             else:
                 return None
 
@@ -192,9 +225,33 @@ class HueButtonEvent:
         s = m.payload.decode(encoding='UTF8')
         topic = m.topic.split('/')
         if len(topic) == 3 and topic[0] == 'hue' and topic[2] == 'buttonevent':
-            return HueButtonEvent(switch=topic[1],
-                                  button=int(s[0]),
-                                  interaction=HueInteractionType(int(s[3])))
+            event = HueButtonEvent(switch=topic[1],
+                                   button=int(s[0]),
+                                   interaction=HueInteractionType(int(s[3])))
+            LOG.debug(f'found hue bridge event : {event}')
+            return event
+
+
+class BifrostAction(Enum):
+    ON = auto(),
+    UP = auto(),
+    DOWN = auto(),
+    OFF = auto()
+
+
+@dataclass
+class BifrostEvent:
+    switch: str
+    action: BifrostAction
+
+    @staticmethod
+    def from_message(m: MQTTMessage) -> Optional['BifrostEvent']:
+        s = m.payload.decode(encoding='UTF8')
+        topic = m.topic.split('/')
+        if len(topic) == 3 and topic[0] == 'bifrost':
+            event = BifrostEvent(switch=topic[1], action=BifrostAction[topic[2].upper()])
+            LOG.debug(f'found bifrost event : {event}')
+            return event
 
 
 @dataclass
@@ -239,33 +296,52 @@ with MQTTContext(host=config_file['mqtt']['host'],
                  port=config_file['mqtt']['port'],
                  user=config_file['mqtt']['user'],
                  password=config_file['mqtt']['password'],
-                 subscriptions='hue/+/buttonevent') as client:
+                 subscriptions=['hue/+/buttonevent', 'bifrost/+/+']) as client:
     queue = build_message_queue(client)
     switch_to_mapping = {entry.switch: entry for entry in config}
     while not handler.sigint:
         try:
-            message: HueButtonEvent = queue.get(block=True, timeout=0.1)
-            if message.switch in switch_to_mapping:
-                mapping: HueMapping = switch_to_mapping[message.switch]
-                pb: Pixelblaze = mapping.pb
-                if pb is not None:
-                    brightness = pb.getBrightnessSlider()
-                    if message.button == 1 and message.interaction == HueInteractionType.CLICK:
-                        # Main 'I' button, cycle through patterns or restore default brightness
-                        # if currently zero
-                        if brightness == 0:
-                            pb.setBrightnessSlider(mapping.default_brightness)
-                        else:
-                            pb.nextSequencer()
-                    if message.button == 2 and (message.interaction == HueInteractionType.HOLD or
-                                                message.interaction == HueInteractionType.CLICK):
-                        # Hold or click the bright / dim buttons to increase / decrease brightness
-                        pb.setBrightnessSlider(min(1.0, brightness + 0.1))
-                    if message.button == 3 and (message.interaction == HueInteractionType.HOLD or
-                                                message.interaction == HueInteractionType.CLICK):
-                        pb.setBrightnessSlider(max(0.1, brightness - 0.1))
-                    if message.button == 4 and message.interaction == HueInteractionType.CLICK:
-                        # Click the 'O' button to set brightness to zero
-                        pb.setBrightnessSlider(0)
+            message = queue.get(block=True, timeout=0.1)
+            if isinstance(message, HueButtonEvent):
+                # Regular behaviour, use Hue bridge messages
+                if message.switch in switch_to_mapping:
+                    mapping: HueMapping = switch_to_mapping[message.switch]
+                    pb: Pixelblaze = mapping.pb
+                    if pb is not None:
+                        brightness = pb.getBrightnessSlider()
+                        if message.button == 1 and message.interaction == HueInteractionType.CLICK:
+                            # Main 'I' button, cycle through patterns or restore default brightness
+                            # if currently zero
+                            if brightness == 0:
+                                pb.setBrightnessSlider(mapping.default_brightness)
+                            else:
+                                pb.nextSequencer()
+                        if message.button == 2 and (message.interaction == HueInteractionType.HOLD or
+                                                    message.interaction == HueInteractionType.CLICK):
+                            # Hold or click the bright / dim buttons to increase / decrease brightness
+                            pb.setBrightnessSlider(min(1.0, brightness + 0.1))
+                        if message.button == 3 and (message.interaction == HueInteractionType.HOLD or
+                                                    message.interaction == HueInteractionType.CLICK):
+                            pb.setBrightnessSlider(max(0.1, brightness - 0.1))
+                        if message.button == 4 and message.interaction == HueInteractionType.CLICK:
+                            # Click the 'O' button to set brightness to zero
+                            pb.setBrightnessSlider(0)
+            elif isinstance(message, BifrostEvent):
+                if message.switch in switch_to_mapping:
+                    mapping: HueMapping = switch_to_mapping[message.switch]
+                    pb: Pixelblaze = mapping.pb
+                    if pb is not None:
+                        brightness = pb.getBrightnessSlider()
+                        if message.action == BifrostAction.ON:
+                            if brightness == 0:
+                                pb.setBrightnessSlider(mapping.default_brightness)
+                            else:
+                                pb.nextSequencer()
+                        if message.action == BifrostAction.UP:
+                            pb.setBrightnessSlider(min(1.0, brightness + 0.1))
+                        if message.action == BifrostAction.DOWN:
+                            pb.setBrightnessSlider(max(0.1, brightness - 0.1))
+                        if message.action == BifrostAction.OFF:
+                            pb.setBrightnessSlider(0)
         except Empty:
             pass
