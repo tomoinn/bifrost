@@ -1,0 +1,90 @@
+blueprint:
+  domain: automation
+  name: Bifrost actions with Hue dimmer switches (RWL021 and RWL022)
+  description: >  
+    Use Bifrost without the hue bridge, at the moment this just sends messages directly 
+    corresponding to the buttons on the dimmer switch, the latest bifrost container
+    listens to these messages and talks to the pixelblaze controllers
+  input:
+    zha_device_21:
+      name: Dimmer switch
+      description: Switch to use to control pixelblaze (RWL021), use either this or the RWL022 entry below. If both are specified this will be used in preference.
+      selector:
+        device:
+          filter:
+            integration: zha
+            model: RWL021
+          entity:
+            - domain: sensor
+              device_class: battery
+          multiple: false
+      default: null
+    zha_device_22:
+      name: Dimmer switch
+      description: Switch to use to control pixelblaze (RWL022)
+      selector:
+        device:
+          filter:
+            integration: zha
+            model: RWL022
+          entity:
+            - domain: sensor
+              device_class: battery
+          multiple: false
+      default: null
+    pixelblaze_switch:
+      name: Pixelblaze switch name
+      description: Should match the switch name in the bifrost configuration
+      selector:
+        text:
+          multiline: false
+          type: text
+      default: ''
+mode: queued
+max_exceeded: silent
+variables:
+  device_id_21: !input zha_device_21
+  device_id_22: !input zha_device_22
+  device_id: >
+    {% if device_id_21 is defined and device_id_21!=None %}
+    {{ device_id_21 }}
+    {% else %}
+    {{ device_id_22 }}
+    {% endif %}
+trigger:
+- platform: event
+  event_type: zha_event
+condition: '{{ trigger.event.data.device_id == device_id }}'
+action:
+- variables:
+    pixelblaze_switch: !input pixelblaze_switch
+    command_type: '{{ trigger.event.data.command }}'
+- choose:
+  - conditions: '{{ command_type == "on_press" }}'
+    sequence:
+    - service: mqtt.publish
+      data:
+        qos: 0
+        retain: false
+        topic: 'bifrost/{{ pixelblaze_switch }}/on'
+  - conditions: '{{ command_type == "off_press" }}'
+    sequence:
+    - service: mqtt.publish 
+      data:
+        qos: 0
+        retain: false
+        topic: 'bifrost/{{ pixelblaze_switch }}/off'
+  - conditions: '{{ command_type == "up_press" or command_type == "up_hold" }}'
+    sequence:
+    - service: mqtt.publish 
+      data:
+        qos: 0
+        retain: false
+        topic: 'bifrost/{{ pixelblaze_switch }}/up'
+  - conditions: '{{ command_type == "down_press" or command_type == "down_hold" }}'
+    sequence:
+    - service: mqtt.publish
+      data:
+        qos: 0
+        retain: false
+        topic: 'bifrost/{{ pixelblaze_switch }}/down'
